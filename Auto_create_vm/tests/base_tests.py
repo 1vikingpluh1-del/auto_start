@@ -58,6 +58,10 @@ class BaseTest:
         self._logger.info(f"старт теста [{self.test_id}] {self.name}")
         try:
             self.execute(**context)
+        except _SkipException as e:  # <--- ДОБАВИТЬ ЭТО
+            self._result.status = Status.SKIPPED
+            self._result.message = str(e)
+            self._logger.warning(f"Skipped: {e}")
         except AssertionError as e:
             self._result.status = Status.FAILED
             self._result.message = str(e)

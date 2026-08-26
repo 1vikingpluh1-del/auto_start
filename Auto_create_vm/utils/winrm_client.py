@@ -98,6 +98,26 @@ class WinRMClient:
         if not self._session:
             raise RuntimeError("WinRM не подключен. Вызовите connect() сначала")
 
+    def file_exists(self, remote_path: str) -> bool:
+        """Проверить существование файла на ВМ"""
+        safe_path = remote_path.replace("'", "''")
+        code, out, _ = self.run_ps(f"Test-Path -LiteralPath '{safe_path}'", check=False)
+        return out.strip().lower() == "true"
+
+    def delete_file(self, remote_path: str) -> None:
+        """Удалить файл на ВМ, если он есть"""
+        safe_path = remote_path.replace("'", "''")
+        self.run_ps(f"Remove-Item -LiteralPath '{safe_path}' -Force -ErrorAction SilentlyContinue", check=False)
+
+    def wait_for_remote_file(self, remote_path: str, timeout_sec: int = 1800, interval_sec: int = 10) -> bool:
+        """Ждать появления файла на ВМ"""
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            if self.file_exists(remote_path):
+                return True
+            time.sleep(interval_sec)
+        return False
+
     @staticmethod
     def _decode_stream(data) -> str:
         """Умное декодирование: UTF-16LE только если есть нулевые байты"""

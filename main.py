@@ -13,11 +13,13 @@ from Auto_create_vm.config import VM_CONFIG
 
 logger = get_logger("Main")
 
-def create_single_vm_task(manager:VCenterManager, vm_cfg:dict) -> dict:
+def create_single_vm_task(manager: VCenterManager, vm_cfg: dict) -> dict:
     """Метод для создания одной ВМ в отдельном потоке"""
+    # ИСПРАВЛЕНО: нормализуем os_type (убираем пробелы и приводим к lower),
+    # чтобы сравнение == "windows" точно сработало.
     result = {
-        "name": vm_cfg["new_name"],
-        "os_type": vm_cfg.get("os_type", "unknown"),
+        "name": str(vm_cfg.get("new_name", "")).strip(),
+        "os_type": str(vm_cfg.get("os_type", "unknown")).strip().lower(),
         "ip": None,
         "error": None
     }
@@ -89,7 +91,7 @@ def run_sequential():
         else:
             print(f"\n {result['name']} создана, но IP не получен.\n")
 
-        logger.info("Все задачи по созданию ВМ завершены!")
+    logger.info("Все задачи по созданию ВМ завершены!")
 
 
 def run_parallel(max_workers: int = 2):
@@ -130,7 +132,7 @@ def run_parallel(max_workers: int = 2):
                 if result["ip"]:
                     # ПРОВЕРЯЕМ ТИП ОС
                     if result.get("os_type") == "windows":
-                        logger.info(f"🚀 Запуск сценария тестирования для Windows ВМ: {result['name']}")
+                        logger.info(f"Запуск сценария тестирования для Windows ВМ: {result['name']}")
                         try:
                             run_tests_for_vm(
                                 vm_name=result["name"],

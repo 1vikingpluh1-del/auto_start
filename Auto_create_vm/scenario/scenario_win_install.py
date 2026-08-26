@@ -2,11 +2,12 @@
 Полный сценарий: существующая ВМ -> WinRM ->
 ПК сам скачивает артефакт с TeamCity (Python+OpenSSL = TLS 1.3) ->
 ПК раздаёт файл ВМ по локальному HTTP (без TLS, без прокси) ->
-ГРАФИЧЕСКАЯ установка -> проверка
+ГРАФИЧЕСКАЯ установка через pywinauto -> проверка
 """
 import argparse
 import functools
 import http.server
+import json
 import os
 import socket
 import socketserver
@@ -31,6 +32,13 @@ TEST_VM_IP = "192.168.202.212"
 HTTP_PORT = 8000
 INSTALL_BASE_PATH = r"C:\BOLID\ARM_ORION_PRO_2_0_1"
 INSTALLER_WAIT_TIMEOUT = 1800  # 30 минут на GUI-установку
+
+# Параметры GUI-автоматизации на ВМ (пути внутри Windows-ВМ)
+VM_PYTHON_EXE = os.getenv("VM_PYTHON_EXE", r"C:\Python312\python.exe")
+VM_GUI_RUNNER_PATH = os.getenv("VM_GUI_RUNNER_PATH", r"C:\AutoTest\gui_install_automation.py")
+VM_GUI_RESULT_PATH = os.getenv("VM_GUI_RESULT_PATH", r"C:\Temp\gui_result.json")
+VM_GUI_LOG_PATH = os.getenv("VM_GUI_LOG_PATH", r"C:\Temp\gui_install_automation.log")
+
 
 try:
     from Auto_create_vm.services.result_recorder import ResultRecorder
@@ -68,7 +76,12 @@ def _start_local_http_server(directory: str, port: int = HTTP_PORT):
     return httpd
 
 
-def test_existing_vm(vm_ip: str):
+def test_existing_vm(
+    vm_ip: str,
+    installer_name: str = "setup",
+    install_path: str = INSTALL_BASE_PATH,
+    vm_name: str = "",
+):
     """Тестирование уже созданной ВМ (без клонирования)"""
     win_user = os.getenv("TEST_WIN_USER")
     win_password = os.getenv("TEST_WIN_PASSWORD")
@@ -84,7 +97,6 @@ def test_existing_vm(vm_ip: str):
     try:
         # ==========================================================
         # ШАГ 0: ПК сам скачивает артефакт с TeamCity
-        # (Python + OpenSSL умеют TLS 1.3, в отличие от Windows 10 на ВМ)
         # ==========================================================
         logger.info("=== ШАГ 0: Скачивание артефакта с TeamCity на ПК ===")
         downloader = TeamCityDownloader()
@@ -103,6 +115,7 @@ def test_existing_vm(vm_ip: str):
         with WinRMClient(host=vm_ip, username=win_user, password=win_password) as winrm:
             logger.info("✓ Подключение по WinRM успешно")
 
+            # ИСПРАВЛЕНО: добавлен Unblock-File, иначе Windows может блокировать запуск скачанного exe
             ps_download_script = f"""
             New-Item -ItemType Directory -Force -Path "C:\\Temp" | Out-Null
             $url = "http://{local_ip}:{HTTP_PORT}/{quote(filename)}"
@@ -115,6 +128,7 @@ def test_existing_vm(vm_ip: str):
                 Write-Error "Файл не скачался: $destPath"
                 exit 1
             }}
+            Unblock-File -Path $destPath -ErrorAction SilentlyContinue
             $size = (Get-Item $destPath).Length
             Write-Host "✓ Скачивание завершено: $destPath ($size байт)"
             Write-Host "INSTALLER_PATH=$destPath"
@@ -135,39 +149,42 @@ def test_existing_vm(vm_ip: str):
             logger.info(f"✓ Установщик на ВМ: {installer_path_on_vm}")
 
             # ==========================================================
-            # ШАГ 2: Запуск ГРАФИЧЕСКОЙ установки через Scheduled Task
+            # ШАГ 2: Запуск теста GUI-автоматизации установки
             # ==========================================================
-            logger.info("=== ШАГ 2: Запуск ГРАФИЧЕСКОЙ установки ===")
-            logger.info("⚠️ ВАЖНО: Откройте консоль ВМ в vSphere Client и завершите установку вручную!")
+            logger.info("=== ШАГ 2: Запуск теста GUI-автоматизации ===")
+            from Auto_create_vm.tests.test_gui_installation import TestGuiWizardWalkthrough
 
-            installer_process_name = Path(installer_path_on_vm).stem  # имя без .exe
-
-            winrm.run_interactive(
-                exe_path=installer_path_on_vm,
-                arguments="",
+            gui_test = TestGuiWizardWalkthrough(
+                winrm_client=winrm,
+                installer_path=installer_path_on_vm,
+                install_path=install_path,
                 user=win_user,
-                task_name="GraphicalInstallTask"
+                python_exe=VM_PYTHON_EXE,
+                runner_path=VM_GUI_RUNNER_PATH,
+                result_path=VM_GUI_RESULT_PATH,
+                log_path=VM_GUI_LOG_PATH,
+                timeout_sec=3600,  # обход + реальная установка может идти долго
             )
-            logger.info(f"✅ Задача запущена. Жду завершения процесса '{installer_process_name}'...")
 
-            time.sleep(5)  # даём процессу стартовать
-            start_wait = time.time()
-            while winrm.is_process_running(installer_process_name):
-                if time.time() - start_wait > INSTALLER_WAIT_TIMEOUT:
-                    logger.warning("⚠️ Превышено время ожидания установки (30 мин).")
-                    break
-                time.sleep(10)
-            logger.info("✅ Процесс установки завершен. Переходим к проверке.")
+            # Запускаем тест через BaseTest.run()
+            gui_result = gui_test.run()
+            results.append(gui_result)
+
+            if gui_result.status.value != "passed":
+                # Если GUI-тест упал, прерываем сценарий, нет смысла проверять файлы
+                raise RuntimeError(f"Тест GUI-установки провален: {gui_result.message}")
 
         # ==========================================================
         # ШАГ 3: Проверка установки (тест WIN-INSTALL-001)
         # ==========================================================
         logger.info("=== ШАГ 3: Запуск тестов проверки установки ===")
+        installer_process_name = Path(installer_path_on_vm).stem
+
         with WinRMClient(host=vm_ip, username=win_user, password=win_password) as winrm:
             test = TestInstallation(
                 winrm_client=winrm,
                 installer_name=installer_process_name,
-                install_path=INSTALL_BASE_PATH
+                install_path=install_path,
             )
             result = test.run()
             results.append(result)
@@ -181,18 +198,34 @@ def test_existing_vm(vm_ip: str):
         logger.error(f"❌ Критическая ошибка в сценарии: {type(e).__name__}: {e}")
     finally:
         if httpd:
-            httpd.shutdown()
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
             logger.info("Локальный HTTP-сервер остановлен")
         recorder.save_results(results, scenario_name="win_install_gui_existing_vm")
         logger.info("=== Сценарий завершен ===")
 
 
-def run_tests_for_vm(vm_name: str, vm_ip: str,
-                     installer_name: str = "setup",
-                     install_path: str = INSTALL_BASE_PATH):
+def run_tests_for_vm(
+    vm_name: str,
+    vm_ip: str,
+    installer_name: str = "setup",
+    install_path: str = INSTALL_BASE_PATH,
+):
     """Точка входа для main.py (связка создание ВМ -> тесты)"""
     logger.info(f"🚀 Сценарий для {vm_name} ({vm_ip})")
-    test_existing_vm(vm_ip)
+    # ИСПРАВЛЕНО: параметры теперь реально передаются в test_existing_vm
+    test_existing_vm(
+        vm_ip=vm_ip,
+        installer_name=installer_name,
+        install_path=install_path,
+        vm_name=vm_name,
+    )
 
 
 if __name__ == "__main__":
